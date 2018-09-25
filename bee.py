@@ -1,23 +1,18 @@
-import getopt
+import argparse
 import os
 import random
 import string
 import sys
 import time
-from datetime import datetime
 
 from redis import StrictRedis
 
-# Сообщение с подсказкой. Показывается при запуске с параметром 'help'
-HELP_TEXT = 'bee.py [getErrors][help]'
 
 # Ключи redis
 # Сообщения пишущего процесса
 MSGS_KEY = 'bee_msgs'
-# PID пишущего процесса
+# ID пишущего процесса
 WRITER_KEY = 'writer'
-# Время последней записи
-WRITING_TIME_KEY = 'writing_time'
 # Сообщения, содержащие ошибку
 ERR_MSGS_KEY = 'err_msgs'
 
@@ -25,52 +20,47 @@ ERR_MSGS_KEY = 'err_msgs'
 WRITE_DELAY = 0.5
 READ_DELAY = 1
 
-PID = os.getpid()
+# Время хранения ID пишущего процесса (ms)
+WRITER_KEY_EXPIRE = 5000
+
+# ID текущего процесса. Состоит из PID и 5-и рандомных ascii_uppercase
+ID = f'{os.getpid()}_{"".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(5))}'  # noqa
+
+
+def parse_args():
+    arg_parser = argparse.ArgumentParser()
+    arg_parser.add_argument(
+        '-e', '--errors',
+        help='Собрать сообщения с ошибками',
+        action='store_true'
+    )
+
+    return arg_parser.parse_args()
 
 
 def check_writer(client):
     """
     Проверка существования пишушего процесса.
-    Проверяется, записан ли PID пишущего процесса и последнее время записи:
-    - Если отсутствует PID, проверяющий процесс станивится пишущим.
-    - Если PID записан и равен PID'у проверяющего процесса, значит проверяющий
+    Проверяется, записан ли ID пишущего процесса:
+    - Если отсутствует ID, проверяющий процесс станивится пишущим.
+    - Если ID записан и равен ID проверяющего процесса, значит проверяющий
     процесс уже является пишущим.
-    - Если PID записан, но последняя запись была больше 5-и секунд назад, то
-    проверяющий процесс становится пишущим.
+
+    Для WRITER_KEY задаётся expire в WRITER_KEY_EXPIRE ms.
     """
-    writer, last_writing = client.mget(WRITER_KEY, WRITING_TIME_KEY)
+    writer = client.get(WRITER_KEY)
 
-    if not writer:
-        client.mset({
-            WRITER_KEY: PID,
-            WRITING_TIME_KEY: datetime.now()
-        })
+    if not writer or writer.decode('utf-8') == ID:
+        # Даже если процесс уже является пишущим, нужно обновить значение.
+        client.psetex(WRITER_KEY, WRITER_KEY_EXPIRE, ID)
         return True
-
-    if writer and last_writing:
-        writer = int(writer)
-        if writer == PID:
-            return True
-
-        last_writing = datetime.strptime(
-            last_writing.decode('utf-8'), '%Y-%m-%d %H:%M:%S.%f'
-        )
-        if (datetime.now() - last_writing).seconds > 5:
-            client.mset({
-                WRITER_KEY: PID,
-                WRITING_TIME_KEY: datetime.now()
-            })
-            return True
 
     return False
 
 
 def write_msg(client):
     """Запись рандомной строки в redis"""
-    client.mset({
-        WRITER_KEY: PID,
-        WRITING_TIME_KEY: datetime.now()
-    })
+    client.psetex(WRITER_KEY, WRITER_KEY_EXPIRE, ID)
     msg = ''.join(
         random.choice(
             string.ascii_uppercase + string.digits
@@ -94,34 +84,7 @@ def read_msg(client):
     time.sleep(READ_DELAY)
 
 
-def gather_err_msgs(client):
-    """
-    Сбор сообщений, содержащих ошибки с их удалением из redis и
-    выводом в консоль.
-    После этого приложение завершает работу.
-    """
-    msgs = client.lrange(ERR_MSGS_KEY, 0, -1)
-    client.delete(ERR_MSGS_KEY)
-    print([msg for msg in msgs])
-    sys.exit(0)
-
-
-def main(argv):
-    try:
-        opts, args = getopt.getopt(argv, '', ['getErrors', 'help'])
-    except getopt.GetoptError:
-        print(HELP_TEXT)
-        sys.exit(2)
-
-    if 'help' in args:
-        print(HELP_TEXT)
-        sys.exit(0)
-
-    client = StrictRedis(host='localhost', port=6379)
-
-    if 'getErrors' in args:
-        gather_err_msgs(client)
-
+def main_loop(client):
     while True:
         is_writer = check_writer(client)
         if is_writer:
@@ -130,5 +93,27 @@ def main(argv):
             read_msg(client)
 
 
+def gather_err_msgs(client):
+    """
+    Сбор сообщений, содержащих ошибки с их удалением из redis и
+    выводом в консоль.
+    После этого приложение завершает работу.
+    """
+    msgs = client.lrange(ERR_MSGS_KEY, 0, -1)
+    client.delete(ERR_MSGS_KEY)
+    print([msg.decode('utf-8') for msg in msgs])
+
+
+def main(get_errors=False):
+    client = StrictRedis(host='localhost', port=6379)
+
+    if get_errors:
+        gather_err_msgs(client)
+        sys.exit(0)
+
+    main_loop(client)
+
+
 if __name__ == '__main__':
-    main(sys.argv[1:])
+    args = parse_args()
+    main(get_errors=args.errors)
